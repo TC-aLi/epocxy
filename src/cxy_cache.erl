@@ -36,6 +36,7 @@
                    return_cache_miss/2,     return_cache_delete/2,
                    return_and_count_cache/4
                   ]}).
+-compile([{parse_transform, lager_transform}]).
 
 %% External interface
 -export([
@@ -48,17 +49,19 @@
          refresh_item/2, refresh_item/3,
          fetch_item_version/2,
          is_cached/2,
-         get_and_clear_counts/1
+         get_and_clear_counts/1,
+         change_threshold_type/3,
+         change_threshold/2
         ]).
 
 %% Comparator functions called from gen_fun() closure.
 -export([new_gen_count_threshold/4, new_gen_time_threshold/4]).
 
 %% Manual generation change functions, must be called from ets owner process.
--export([new_generation/1, maybe_make_new_generation/1]).
+-export([new_generation/1, maybe_make_new_generation/1, make_new_generation/1]).
 
 -type cache_name()     :: atom().
--type thresh_type()    :: count | time.
+-type thresh_type()    :: count | time_clear | time.
 -type gen_fun()        :: fun((cache_name(), non_neg_integer(), erlang:timestamp()) -> boolean()).
 -type gen_fun_opt()    :: none | gen_fun().
 -type check_gen_fun()  :: gen_fun_opt() | thresh_type().
@@ -141,7 +144,7 @@ reserve(Cache_Name, Cache_Mod, Threshold_Type, Threshold)
        %% New generation per access count can be any integer...
        (Threshold_Type =:= count andalso Threshold > 0
         %% But time-based generations can't be faster than 1 millisecond.
-        orelse Threshold_Type =:= time andalso Threshold >= 1000) ->
+        orelse (Threshold_Type =:= time_clear orelse Threshold_Type =:= time) andalso Threshold >= 1000) ->
 
     case init_meta_index(Cache_Name, Cache_Mod, Threshold_Type, Threshold) of
         false -> {error, already_exists};
@@ -299,6 +302,7 @@ delete(Cache_Name)
 %% @doc Replace the existing new generation decision function.
 replace_check_generation_fun(Cache_Name, Fun)
   when is_atom(Cache_Name), Fun =:= none;
+       is_atom(Cache_Name), Fun =:= time_clear;
        is_atom(Cache_Name), Fun =:= time;
        is_atom(Cache_Name), Fun =:= count;
        is_atom(Cache_Name), is_function(Fun, 3) ->
@@ -603,7 +607,46 @@ determine_newest_version(Cache_Name, Mod, Insert_Vsn, Cached_Vsn) ->
         false -> insert_is_newer
     end.
 
-        
+change_threshold_type(Cache_Name, From, To)
+  when From =:= time, To =:= time_clear;
+       From =:= time_clear, To =:= time ->
+    case ?GET_METADATA(Cache_Name) of
+        [] ->
+            log_error({no_cache_metadata, Cache_Name});
+        [#cxy_cache_meta{old_gen = Old_Gen_Id, new_generation_function = From}] ->
+            case {From, To} of
+                {time_clear, time} ->
+                    ?DO_METADATA(ets:update_element(?MODULE, Cache_Name, [{#cxy_cache_meta.new_generation_function, To}]));
+                {time, time_clear} ->
+                    try
+                        ets:delete_all_objects(Old_Gen_Id),
+                        ?DO_METADATA(ets:update_element(?MODULE, Cache_Name, [{#cxy_cache_meta.new_generation_function, To}]))
+                    catch _:_ ->
+                        log_error({old_gen_not_cleared, Cache_Name})
+                    end
+            end;
+        [#cxy_cache_meta{new_generation_function = To}] ->
+            log_error({already, {Cache_Name, To}});
+        _ ->
+            log_error({unknown, Cache_Name, From, To})
+    end;
+change_threshold_type(Cache_Name, From, To) ->
+    log_error({not_supported, Cache_Name, From, To}).
+
+change_threshold(Cache_Name, Threshold) when is_integer(Threshold) ->
+    case ?GET_METADATA(Cache_Name) of
+        [] ->
+            log_error({no_cache_metadata, Cache_Name});
+        [#cxy_cache_meta{}] ->
+            ?DO_METADATA(ets:update_element(?MODULE, Cache_Name, [{#cxy_cache_meta.new_generation_thresh, Threshold}]))
+    end;
+change_threshold(Cache_Name, Threshold) ->
+    log_error({not_supported, Cache_Name, Threshold}).
+
+log_error(Reason) ->
+    lager:error("Error changing cache threshold or type ~p", [Reason]),
+    {error, Reason}.
+
 %%%------------------------------------------------------------------------------
 %%% Generation creation utilities
 %%%
@@ -629,8 +672,15 @@ new_generation(Cache_Name) ->
             new_generation(Cache_Name, New_Gen_Id, New_Time, Old_Gen_Id)
     end.
 
+%% @doc Create a new generation.
+make_new_generation(Cache_Name) ->
+    maybe_make_new_generation(Cache_Name, true).
+
 %% @doc Create a new generation if the generation test returns true.
 maybe_make_new_generation(Cache_Name) ->
+    maybe_make_new_generation(Cache_Name, false).
+
+maybe_make_new_generation(Cache_Name, Force) ->
     case ?GET_METADATA(Cache_Name) of
         [] -> {error, {no_cache_metadata, Cache_Name}};
 
@@ -641,15 +691,18 @@ maybe_make_new_generation(Cache_Name) ->
 
             case New_Gen_Fun of
                 none -> false;
+                time_clear ->
+                    Time_Expired = Force orelse timer:now_diff(os:timestamp(), New_Time) > Thresh,
+                    clear_generation_finish(Cache_Name, Metadata, Time_Expired);
                 time ->
-                    Time_Expired = timer:now_diff(os:timestamp(), New_Time) > Thresh,
+                    Time_Expired = Force orelse timer:now_diff(os:timestamp(), New_Time) > Thresh,
                     make_generation_finish(Cache_Name, Metadata, Time_Expired);
                 count ->
-                    Count_Exceeded = Fetch_Count > Thresh,
+                    Count_Exceeded = Force orelse Fetch_Count > Thresh,
                     make_generation_finish(Cache_Name, Metadata, Count_Exceeded);
                 _Function ->
-                    New_Generation_Required
-                        = try New_Gen_Fun(Cache_Name, Fetch_Count, New_Time)
+                    New_Generation_Required = Force orelse
+                          try New_Gen_Fun(Cache_Name, Fetch_Count, New_Time)
                           catch Type:Class ->
                                   Error = {error, {Type,Class,
                                                    {maybe_make_new_generation, New_Gen_Fun,
@@ -667,6 +720,24 @@ make_generation_finish( Cache_Name,  Metadata, true ) ->
     _New_Empty_Gen_Id = new_generation(Cache_Name, New_Gen_Id, New_Time, Old_Gen_Id),
     true.
 
+clear_generation_finish(_Cache_Name, _Metadata, false) -> false;
+clear_generation_finish( Cache_Name,  Metadata, true) ->
+    #cxy_cache_meta{new_gen=New_Gen_Id} = Metadata,
+    Empty_Gen_Id = new_cache_gen(Cache_Name),
+    New_Metadata = [
+                    %% Reset the fetch count so it can be used for generation measurement...
+                    {#cxy_cache_meta.fetch_count,  0},
+
+                    %% Create an empty generation for the new_gen metadata slot...
+                    {#cxy_cache_meta.new_gen_time, os:timestamp()},
+                    {#cxy_cache_meta.new_gen,      Empty_Gen_Id}
+                   ],
+
+    %% Update the metadata record atomically with the new generation info...
+    _ = ?DO_METADATA(ets:update_element(?MODULE, Cache_Name, New_Metadata)),
+    _ = ?WHEN_GEN_EXISTS(New_Gen_Id, ets:delete(New_Gen_Id)),
+    Empty_Gen_Id,
+    true.
 
 %% Create a new generation cache and update the metadata to reflect its existence.
 new_generation(Cache_Name, New_Gen_Id, New_Time, Old_Gen_Id) ->

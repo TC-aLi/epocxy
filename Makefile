@@ -1,10 +1,11 @@
 PROJECT = epocxy
 V = 0
 
-DEPS = proper
+DEPS = proper lager
 ## DEPS = proper eper  # when debugging
 
 dep_proper = git https://github.com/manopapad/proper master
+dep_lager = git https://github.com/erlang-lager/lager.git master
 
 ERLC_OPTS := +debug_info +"{cover_enabled, true}"
 TEST_ERLC_OPTS := -I include -I test/epocxy $(ERLC_OPTS)

@@ -37,7 +37,8 @@
 -record(ecf_state, {
           cache_name                  :: cxy_cache:cache_name(),
           cache_meta_ets = cxy_cache  :: cxy_cache,
-          poll_frequency = ?POLL_FREQ :: pos_integer()
+          poll_frequency = ?POLL_FREQ :: pos_integer(),
+          time_ref                    :: reference()
          }).
 
 
@@ -64,43 +65,44 @@
 start_link(Cache_Name, Cache_Mod)
     when is_atom(Cache_Name), is_atom(Cache_Mod) ->
     Cache_Name = cxy_cache:reserve(Cache_Name, Cache_Mod),
-    gen_fsm:start_link(?MODULE, {Cache_Name}, []).
+    gen_fsm:start_link({local, Cache_Name}, ?MODULE, {Cache_Name}, []).
 
 start_link(Cache_Name, Cache_Mod, Gen_Fun)
   when is_atom(Cache_Name), is_atom(Cache_Mod), is_function(Gen_Fun, 3) ->
     Cache_Name = cxy_cache:reserve(Cache_Name, Cache_Mod, Gen_Fun),
-    gen_fsm:start_link(?MODULE, {Cache_Name}, []).
+    gen_fsm:start_link({local, Cache_Name}, ?MODULE, {Cache_Name}, []).
 
 %% Change frequency that generation function runs...
 start_link(Cache_Name, Cache_Mod, Gen_Fun, Poll_Time)
   when is_atom(Cache_Name), is_atom(Cache_Mod), is_function(Gen_Fun, 3),
        is_integer(Poll_Time), Poll_Time >= 10 ->
     Cache_Name = cxy_cache:reserve(Cache_Name, Cache_Mod, Gen_Fun),
-    gen_fsm:start_link(?MODULE, {Cache_Name, Poll_Time}, []);
-%% Use strictly time-based microsecond generational change
+    gen_fsm:start_link({local, Cache_Name}, ?MODULE, {Cache_Name, Poll_Time}, []);
+%% Use strictly time-based microsecond generational change, or clear
 %% (but millisecond granularity on FSM polling)...
-start_link(Cache_Name, Cache_Mod, time, Gen_Frequency)
+start_link(Cache_Name, Cache_Mod, Threshold_Type, Gen_Frequency)
   when is_atom(Cache_Name), is_atom(Cache_Mod),
+       (Threshold_Type =:= time_clear orelse Threshold_Type =:= time),
        is_integer(Gen_Frequency), Gen_Frequency >= 10000 ->
-    Cache_Name = cxy_cache:reserve(Cache_Name, Cache_Mod, time, Gen_Frequency),
-    Poll_Time = round(Gen_Frequency / 1000) + 1,
-    gen_fsm:start_link(?MODULE, {Cache_Name, Poll_Time}, []);
+    Cache_Name = cxy_cache:reserve(Cache_Name, Cache_Mod, Threshold_Type, Gen_Frequency),
+    Poll_Time = get_poll_time_from_threshold(Gen_Frequency),
+    gen_fsm:start_link({local, Cache_Name}, ?MODULE, {Cache_Name, Poll_Time}, []);
 %% Generational change occurs based on access frequency (using default polling time to check).
 start_link(Cache_Name, Cache_Mod, count, Threshold)
   when is_atom(Cache_Name), is_atom(Cache_Mod), is_integer(Threshold), Threshold > 0 ->
     Cache_Name = cxy_cache:reserve(Cache_Name, Cache_Mod, count, Threshold),
-    gen_fsm:start_link(?MODULE, {Cache_Name}, []);
+    gen_fsm:start_link({local, Cache_Name}, ?MODULE, {Cache_Name}, []);
 %% Override default polling with a non-generational cache.
 start_link(Cache_Name, Cache_Mod, none, Poll_Time)
   when is_atom(Cache_Name), is_atom(Cache_Mod), is_integer(Poll_Time), Poll_Time >= 10 ->
     Cache_Name = cxy_cache:reserve(Cache_Name, Cache_Mod, none),
-    gen_fsm:start_link(?MODULE, {Cache_Name, Poll_Time}, []).
+    gen_fsm:start_link({local, Cache_Name}, ?MODULE, {Cache_Name, Poll_Time}, []).
 
 %% Generational change occurs based on access frequency (using override polling time to check).
 start_link(Cache_Name, Cache_Mod, count, Threshold, Poll_Time)
   when is_atom(Cache_Name), is_atom(Cache_Mod), is_integer(Threshold), Threshold > 0 ->
     Cache_Name = cxy_cache:reserve(Cache_Name, Cache_Mod, count, Threshold),
-    gen_fsm:start_link({local, ?SERVER}, ?MODULE, {Cache_Name, Poll_Time}, []).
+    gen_fsm:start_link({local, Cache_Name}, ?MODULE, {Cache_Name, Poll_Time}, []).
 
 
 %%%===================================================================
@@ -130,8 +132,8 @@ init({Cache_Name, Poll_Millis}) ->
     init_finish(Init_State).
 
 init_finish(#ecf_state{poll_frequency=Poll_Millis} = Init_State) ->
-    erlang:send_after(Poll_Millis, self(), timeout),
-    {ok, 'POLL', Init_State}.
+    TRef = erlang:send_after(Poll_Millis, self(), timeout),
+    {ok, 'POLL', Init_State#ecf_state{time_ref = TRef}}.
 
 terminate   (_Reason, _State_Name, #ecf_state{}) -> ok.
 code_change (_OldVsn,  State_Name, #ecf_state{} = State, _Extra) -> {ok, State_Name, State}.
@@ -147,9 +149,28 @@ code_change (_OldVsn,  State_Name, #ecf_state{} = State, _Extra) -> {ok, State_N
 
 handle_info (timeout, State_Name,
              #ecf_state{cache_name=Cache_Name, poll_frequency=Poll_Millis} = State) ->
-    _ = cxy_cache:maybe_make_new_generation(Cache_Name),
-    erlang:send_after(Poll_Millis, self(), timeout),
+    cxy_cache:maybe_make_new_generation(Cache_Name),
+    TRef = erlang:send_after(Poll_Millis, self(), timeout),
+    {next_state, State_Name, State#ecf_state{time_ref = TRef}};
+
+handle_info ({change_threshold_type, From, To}, State_Name,
+             #ecf_state{cache_name=Cache_Name} = State) ->
+    cxy_cache:change_threshold_type(Cache_Name, From, To),
     {next_state, State_Name, State};
+
+handle_info ({change_threshold, Threshold, Force}, State_Name,
+             #ecf_state{cache_name=Cache_Name, time_ref=Old_TRef} = State) ->
+    cxy_cache:change_threshold(Cache_Name, Threshold),
+    Poll_Millis = get_poll_time_from_threshold(Threshold),
+    case Force of
+        true ->
+            catch erlang:cancel_timer(Old_TRef),
+            cxy_cache:make_new_generation(Cache_Name),
+            TRef = erlang:send_after(Poll_Millis, self(), timeout),
+            {next_state, State_Name, State#ecf_state{poll_frequency = Poll_Millis, time_ref = TRef}};
+        false ->
+            {next_state, State_Name, State#ecf_state{poll_frequency = Poll_Millis}}
+    end;
 
 handle_info (_Info, State_Name, State) ->
     {next_state, State_Name, State}.
@@ -162,3 +183,6 @@ handle_info (_Info, State_Name, State) ->
 
 handle_event      (_Event,        State_Name, State) -> {next_state, State_Name, State}.
 handle_sync_event (_Event, _From, State_Name, State) -> {reply, ok,  State_Name, State}.
+
+get_poll_time_from_threshold(Threshold) ->
+    round(Threshold / 1000) + 1.

@@ -69,7 +69,7 @@ start_cache(Cache_Name, Cache_Mod, Gen_Fun)
 %% Start other types of caches.
 start_cache(Cache_Name, Cache_Mod, Type, Threshold)
   when is_atom(Cache_Name), is_atom(Cache_Mod),
-       (Type =:= count orelse Type =:= time),
+       (Type =:= count orelse Type =:= time_clear orelse Type =:= time),
        is_integer(Threshold), Threshold > 0 ->
     Args = [Cache_Name, Cache_Mod, Type, Threshold],
     supervisor:start_child(?SERVER, Args).
